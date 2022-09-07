@@ -1,28 +1,177 @@
+name: Prod CI pipeline for strategies
+env:
+  AWS_HOST: localstack
+  SERVICES: dynamodb,sqs,s3 # Add more services depending on your test case
+  NODE_ENV: test
+  STAGE: prod
+  # DEV_AWS_ACCESS_KEY_ID: ${{ secrets.PROD_AWS_ACCESS_KEY_ID }}
+  # DEV_AWS_SECRET_ACCESS_KEY: ${{ secrets.PROD_AWS_SECRET_ACCESS_KEY }}
+  # DEV_AWS_SESSION_TOKEN: ${{ secrets.PROD_AWS_SESSION_TOKEN}}
+  # EXPORO_NPM_READ_TOKEN: ${{ secrets.EXPORO_NPM_READ_TOKEN}}
+
 on:
-    workflow_dispatch:
-      inputs:
-        stage_operational:
-          description: 'Is Stage Deployed and operational? Input yes if true.'
-          required: true
-          default: 'no'
+  workflow_dispatch:
+    inputs:
+      stage_operational:
+        description: 'Is Stage Deployed and operational? Input yes if true.'
+        required: true
+        default: 'no'
 
 jobs:
-  aws_cdk:
+  build:
     runs-on: ubuntu-latest
+    container:
+      image: node:12.0.0-alpine
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
-      - uses: actions/setup-node@v2
+      - uses: actions/checkout@v3
         with:
-          node-version: "14"
-      - name: Configure aws credentials
-        uses: aws-actions/configure-aws-credentials@master
+          ref: 'feature/ASANA-1202582818181865'
+      - uses: aws-actions/configure-aws-credentials@v1
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: 'us-east-1'
-      - name: Synth stack
-        run: cdk synth
-      - name: Deploy stack
-        run: cdk deploy --require-approval never
+          aws-access-key-id: ${{ secrets.STAGE_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.STAGE_AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.STAGE_AWS_SESSION_TOKEN}}
+          aws-region: eu-central-1             
+      - run: |
+          mkdir -p /github/workspace
+          cp -Rf . /github/workspace
+          cd /github/workspace
+      - name: Cache node modules
+        id: cache-npm
+        uses: actions/cache@v3
+        env:
+          cache-name: cache-node-modules
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-build-${{ env.cache-name }}
+      - if: ${{ steps.cache-npm.outputs.cache-hit == 'false' }}
+        name: List the state of node modules
+        continue-on-error: true
+        run: npm list
+      - name: Install Backend Dependencies
+        run: |
+          cd backend
+          echo "@exporo:registry=https://npm.pkg.github.com/exporo" >> ~/.npmrc
+          echo "//npm.pkg.github.com/:_authToken=$EXPORO_NPM_READ_TOKEN" >> ~/.npmrc          
+          npm install
+      - name: Compress all files in workspace
+        run: |
+          tar -cvf workspace.tar .
+          ls -la
+          cp workspace.tar /github/workspace
+      - uses: actions/upload-artifact@master
+        with:
+          name: proj-workspace
+          path: /github/workspace/workspace.tar
+
+  test:
+    runs-on: ubuntu-latest
+    needs: [build]
+
+    container:
+      image: node:12.0.0-alpine
+    services:
+      localstack:
+        image: localstack/localstack
+        ports:
+          - 4566:4566 # Localstack exposes all services on same port
+        env:
+          SERVICES: ${{ env.SERVICES }}
+          DEBUG: ""
+          DATA_DIR: ""
+          LAMBDA_EXECUTOR: ""
+          KINESIS_ERROR_PROBABILITY: ""
+          DOCKER_HOST: unix:///var/run/docker.sock
+          HOST_TMP_FOLDER: "/tmp"
+          HOSTNAME_EXTERNAL: ${{ env.AWS_HOST }} # Required so that resource urls are provided properly 
+                                                 # e.g sqs url will get localhost if we don't set this env to map our service
+        options: >-
+          --name=localstack
+          --health-cmd="curl -sS 127.0.0.1:4566 || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3  
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: 'feature/ASANA-1202582818181865'
+      - run: |
+          mkdir -p /github/workspace          
+      - uses: actions/download-artifact@master
+        with:
+          name: proj-workspace
+          path: /github/workspace
+      - run: |
+          ls -la /github/workspace    
+          cd ${GITHUB_WORKSPACE}
+          tar -xvf /github/workspace/workspace.tar 
+      - uses: actions/cache@v2
+        id: cache-npm
+        env:
+          cache-name: cache-node-modules
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-build-${{ env.cache-name }} 
+  
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [test]
+
+    strategy:
+      matrix:
+        node-version: [12.x]  
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          ref: 'feature/ASANA-1202582818181865'
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}    
+      - uses: actions/download-artifact@master
+        with:
+          name: proj-workspace
+          path: ~/workspace
+      - run: |
+          ls -la ~/workspace    
+          cd ${GITHUB_WORKSPACE}
+          tar -xvf ~/workspace/workspace.tar 
+      - uses: actions/cache@v2
+        id: cache-npm
+        env:
+          cache-name: cache-node-modules
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-build-${{ env.cache-name }}     
+      - uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.STAGE_AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.STAGE_AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.STAGE_AWS_SESSION_TOKEN}}    
+          aws-region: eu-central-1         
+      - name: Install Backend Dependencies
+        run: |
+          cd backend
+          echo "@exporo:registry=https://npm.pkg.github.com/exporo" >> ~/.npmrc
+          echo "//npm.pkg.github.com/:_authToken=$EXPORO_NPM_READ_TOKEN" >> ~/.npmrc          
+          npm install
+      - name: Install Serverless      
+        run: |
+          echo "@exporo:registry=https://npm.pkg.github.com/exporo" >> ~/.npmrc
+          echo "//npm.pkg.github.com/:_authToken=$EXPORO_NPM_READ_TOKEN" >> ~/.npmrc 
+          ls -ltr ~/.npmrc
+          cat ~/.npmrc         
+          cd backend
+          npm i -g serverless@2.72.3
+      - run: echo $STAGE  
+      - name: Serverless deploy
+        run: |
+          pwd
+          cd backend
+          serverless deploy --stage stage
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.STAGE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.STAGE_AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN: ${{ secrets.STAGE_AWS_SESSION_TOKEN}} 
+          AWS_SDK_LOAD_CONFIG: 0
+          SLS_DEBUG: '*'
